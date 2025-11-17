@@ -1,13 +1,11 @@
 import math
-import itertools
-from typing import Tuple
+from typing import Dict
 
 import numpy as np
 import pandas as pd
 import streamlit as st
-from pybaseball import statcast_pitcher, playerid_lookup
-from sklearn.ensemble import RandomForestClassifier
-from sklearn.model_selection import train_test_split
+import altair as alt
+from pybaseball import statcast_pitcher, playerid_lookup, playerid_reverse_lookup
 
 # -------------------------------------------------
 # Streamlit page config
@@ -18,94 +16,111 @@ st.set_page_config(
     layout="wide",
 )
 
-st.title(" Pitch Recommendation Engine Based on Tunnel Score")
-
-
 # -------------------------------------------------
-# Utility: get MLBAM ID from pitcher name
+# Helper functions
 # -------------------------------------------------
-def get_mlbam_id(pitcher_name: str) -> int:
+def get_pitcher_id(name: str) -> int:
     """
-    Look up MLBAM ID for a pitcher using pybaseball's playerid_lookup.
-    Assumes 'First Last' format.
+    Look up the MLBAM id for a pitcher using pybaseball's playerid_lookup.
+    Assumes full name 'First Last'. Falls back to a hard-coded dict.
     """
     try:
-        first, last = pitcher_name.strip().split(" ", 1)
-    except ValueError:
-        raise ValueError("Pitcher name must be in 'First Last' format.")
+        first, last = name.split(" ", 1)
+        lookup = playerid_lookup(last, first)
+        if not lookup.empty:
+            return int(lookup.iloc[0]["key_mlbam"])
+    except Exception:
+        pass
 
-    id_df = playerid_lookup(last, first)
-    if id_df.empty:
-        raise ValueError(f"No MLBAM id found for pitcher: {pitcher_name}")
+    # Fallback mapping so things always work
+    NAME_TO_ID: Dict[str, int] = {
+        "Zack Wheeler": 554430,
+    }
+    return NAME_TO_ID.get(name, 554430)
 
-    return int(id_df.iloc[0]["key_mlbam"])
 
-
-# -------------------------------------------------
-# Data pipeline: pull Statcast data from Baseball Savant
-# -------------------------------------------------
-@st.cache_data(show_spinner=True)
-def load_statcast_for_pitcher(
-    pitcher_name: str,
-    season: int = 2024,
-) -> pd.DataFrame:
+@st.cache_data(show_spinner=False)
+def load_statcast_data(pitcher_name: str, start_date: str, end_date: str) -> pd.DataFrame:
     """
-    Pull Statcast data for a single pitcher from Baseball Savant using pybaseball.
-    This replaces the old 'read local CSV' behavior.
+    Load Statcast data for a pitcher between start_date and end_date,
+    and attach batter names.
     """
-    mlbam_id = get_mlbam_id(pitcher_name)
-    # Rough season bounds; adjust if needed
-    start_date = f"{season}-03-01"
-    end_date = f"{season}-11-30"
+    pitcher_id = get_pitcher_id(pitcher_name)
 
-    st.info(f"Pulling Statcast data for {pitcher_name} ({mlbam_id}) from {start_date} to {end_date}…")
-    df = statcast_pitcher(start_date, end_date, mlbam_id)
-
-    # Basic safety check
+    df = statcast_pitcher(start_date, end_date, pitcher_id)
     if df is None or df.empty:
-        raise ValueError(f"No Statcast data returned for {pitcher_name} in {season}.")
+        return pd.DataFrame()
 
-    # Ensure consistent dtypes
-    df["game_date"] = pd.to_datetime(df["game_date"])
-    df = df.sort_values(["game_date", "game_pk", "at_bat_number", "pitch_number"])
+    # Basic fields we care about
+    keep_cols = [
+        "game_date",
+        "game_pk",
+        "at_bat_number",
+        "pitch_number",
+        "pitch_type",
+        "release_pos_x",
+        "release_pos_z",
+        "release_speed",
+        "pfx_x",
+        "pfx_z",
+        "plate_x",
+        "plate_z",
+        "launch_speed",
+        "events",
+        "batter",
+        "bat_score",   # opponent's runs while this pitcher is on the mound
+    ]
+    existing_cols = [c for c in keep_cols if c in df.columns]
+    df = df[existing_cols].copy()
+
+    # Convert date to datetime for easier filtering/plotting
+    if "game_date" in df.columns:
+        df["game_date"] = pd.to_datetime(df["game_date"])
+
+    # Outcome-level columns
+    if "launch_speed" in df.columns:
+        df["outcome_velocity"] = df["launch_speed"]
+    if "events" in df.columns:
+        df["outcome_result"] = df["events"]
+
+    # Map batter IDs to names
+    if "batter" in df.columns:
+        batter_ids = df["batter"].dropna().unique().tolist()
+        if batter_ids:
+            try:
+                reverse = playerid_reverse_lookup(batter_ids, key_type="mlbam")
+                reverse["batter_name"] = (
+                    reverse["name_first"].str.strip() + " " + reverse["name_last"].str.strip()
+                )
+                reverse = reverse[["key_mlbam", "batter_name"]].drop_duplicates()
+                df = df.merge(
+                    reverse,
+                    left_on="batter",
+                    right_on="key_mlbam",
+                    how="left",
+                )
+                df.drop(columns=["key_mlbam"], inplace=True)
+            except Exception:
+                # Fallback: use batter id as string if lookup fails
+                df["batter_name"] = df["batter"].astype(str)
+        else:
+            df["batter_name"] = df["batter"].astype(str)
 
     return df
 
 
-# -------------------------------------------------
-# Feature engineering: tunneling features + tunnel_score
-# -------------------------------------------------
-def minmax_norm(series: pd.Series) -> pd.Series:
-    """Safe min-max normalization (returns 0 if constant)."""
-    s = series.astype(float)
-    s_min, s_max = s.min(), s.max()
-    if pd.isna(s_min) or pd.isna(s_max) or s_min == s_max:
-        return pd.Series(0.0, index=s.index)
-    return (s - s_min) / (s_max - s_min)
-
-
-def engineer_tunneling_features(df: pd.DataFrame) -> pd.DataFrame:
+def compute_tunneling_features(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Given raw Statcast data for a single pitcher, add tunneling-related
-    features and a composite tunnel_score.
-
-    This is where you can iterate on the definition of tunneling:
-      - Release consistency
-      - Early trajectory overlap
-      - Late movement separation
-      - Velocity separation
+    Add tunneling features for each pitch based on the previous pitch in the at-bat.
     """
-    # Work on a copy to avoid mutating cached data
-    df = df.copy()
+    if df.empty:
+        return df
 
-    # Sort properly
-    df = df.sort_values(["game_date", "game_pk", "at_bat_number", "pitch_number"])
+    df = df.sort_values(["game_pk", "at_bat_number", "pitch_number"]).copy()
 
-    # Group by game & at-bat to keep "previous pitch" logic clean
     group_cols = ["game_pk", "at_bat_number"]
-
-    # Columns we will compare to the previous pitch
     cols_to_shift = [
+        "pitch_type",
         "release_pos_x",
         "release_pos_z",
         "release_speed",
@@ -114,211 +129,277 @@ def engineer_tunneling_features(df: pd.DataFrame) -> pd.DataFrame:
         "plate_x",
         "plate_z",
     ]
-
     for col in cols_to_shift:
-        df[f"prev_{col}"] = df.groupby(group_cols)[col].shift(1)
+        if col in df.columns:
+            df[f"prev_{col}"] = df.groupby(group_cols)[col].shift(1)
 
-    # Drop rows where we don't have a previous pitch context
-    df = df.dropna(subset=[f"prev_{c}" for c in cols_to_shift])
+    prev_cols = [f"prev_{c}" for c in cols_to_shift if c in df.columns]
+    df = df.dropna(subset=prev_cols)
 
-    # 1) Release consistency: how similar is the release point to previous pitch?
+    def _safe(arr):
+        return pd.to_numeric(arr, errors="coerce").fillna(0.0)
+
+    # 1) Release consistency
     df["release_diff"] = np.sqrt(
-        (df["release_pos_x"] - df["prev_release_pos_x"]) ** 2
-        + (df["release_pos_z"] - df["prev_release_pos_z"]) ** 2
+        (_safe(df["release_pos_x"]) - _safe(df["prev_release_pos_x"])) ** 2
+        + (_safe(df["release_pos_z"]) - _safe(df["prev_release_pos_z"])) ** 2
     )
 
-    # 2) Early trajectory overlap approximated by plate_x/z similarity
-    #    (proxy for tunnel duration; you can later upgrade to full trajectory)
+    # 2) Trajectory consistency
     df["traj_diff"] = np.sqrt(
-        (df["plate_x"] - df["prev_plate_x"]) ** 2
-        + (df["plate_z"] - df["prev_plate_z"]) ** 2
+        (_safe(df["plate_x"]) - _safe(df["prev_plate_x"])) ** 2
+        + (_safe(df["plate_z"]) - _safe(df["prev_plate_z"])) ** 2
     )
 
-    # 3) Movement deception: how much do the movement profiles differ?
+    # 3) Movement deception
     df["movement_diff"] = np.sqrt(
-        (df["pfx_x"] - df["prev_pfx_x"]) ** 2
-        + (df["pfx_z"] - df["prev_pfx_z"]) ** 2
+        (_safe(df["pfx_x"]) - _safe(df["prev_pfx_x"])) ** 2
+        + (_safe(df["pfx_z"]) - _safe(df["prev_pfx_z"])) ** 2
     )
 
-    # 4) Velocity separation: how different are the velocities?
-    df["velo_diff"] = (df["release_speed"] - df["prev_release_speed"]).abs()
+    # 4) Velocity separation
+    if "release_speed" in df.columns and "prev_release_speed" in df.columns:
+        df["velo_diff"] = (
+            _safe(df["release_speed"]) - _safe(df["prev_release_speed"])
+        ).abs()
+    else:
+        df["velo_diff"] = 0.0
 
-    # Normalize components so they’re comparable in scale
-    df["release_diff_norm"] = minmax_norm(df["release_diff"])
-    df["traj_diff_norm"] = minmax_norm(df["traj_diff"])
-    df["movement_diff_norm"] = minmax_norm(df["movement_diff"])
-    df["velo_diff_norm"] = minmax_norm(df["velo_diff"])
+    def _norm(series: pd.Series) -> pd.Series:
+        s = series.astype(float)
+        rng = s.max() - s.min()
+        if rng == 0 or pd.isna(rng):
+            return pd.Series(0.5, index=s.index)
+        return (s - s.min()) / rng
 
-    # -------------------------------------------------
-    # Composite tunnel_score:
-    #   - Lower release_diff is GOOD (harder for hitter to see difference early)
-    #   - Higher movement_diff and velo_diff are GOOD (late separation)
-    #   - You can choose whether higher or lower traj_diff is "good" for your theory.
-    #
-    # Here:
-    #   tunnel_score = (1 - release_diff_norm) + movement_diff_norm + velo_diff_norm
-    # You can add traj_diff_norm if you want to reward different end-locations.
-    # -------------------------------------------------
-    df["tunnel_score_component_release"] = 1.0 - df["release_diff_norm"]
-    df["tunnel_score_component_movement"] = df["movement_diff_norm"]
-    df["tunnel_score_component_velo"] = df["velo_diff_norm"]
+    df["release_consistency"] = 1.0 - _norm(df["release_diff"])
+    df["traj_consistency"] = 1.0 - _norm(df["traj_diff"])
+    df["movement_deception"] = _norm(df["movement_diff"])
+    df["velo_separation"] = _norm(df["velo_diff"])
 
     df["tunnel_score"] = (
-        df["tunnel_score_component_release"]
-        + df["tunnel_score_component_movement"]
-        + df["tunnel_score_component_velo"]
+        0.30 * df["release_consistency"]
+        + 0.30 * df["traj_consistency"]
+        + 0.20 * df["movement_deception"]
+        + 0.20 * df["velo_separation"]
     )
 
-    # Optional final normalization of tunnel_score
-    df["tunnel_score_norm"] = minmax_norm(df["tunnel_score"])
+    df["tunnel_score_norm"] = _norm(df["tunnel_score"])
 
     return df
 
 
-# -------------------------------------------------
-# Sidebar controls
-# -------------------------------------------------
-with st.sidebar:
-    st.header(" Settings")
+def summarize_games(df_tunnel: pd.DataFrame) -> pd.DataFrame:
+    """
+    Per-game summary: average tunnel score and runs allowed.
+    Runs allowed ~= max(bat_score) - min(bat_score) while pitcher is on mound.
+    """
+    if df_tunnel.empty or "bat_score" not in df_tunnel.columns:
+        return pd.DataFrame()
 
-    # You can replace this with your existing list/dict of pitchers
-    default_pitchers = [
-        "Zack Wheeler",
-        "Aaron Nola",
-        "Corbin Burnes",
-        "Tarik Skubal",
-        "Pablo López",
-    ]
-    pitcher_name = st.selectbox("Select Pitcher", options=default_pitchers)
+    df_g = df_tunnel.copy()
+    df_g["game_date"] = pd.to_datetime(df_g["game_date"])
 
-    season = st.number_input("Season", min_value=2015, max_value=2025, value=2024, step=1)
-
-    show_raw = st.checkbox("Show raw Statcast sample", value=False)
-    show_tunnel_sample = st.checkbox("Show tunneling feature sample", value=True)
-
-
-# -------------------------------------------------
-# Main data & feature pipeline
-# -------------------------------------------------
-try:
-    df_raw = load_statcast_for_pitcher(pitcher_name, season=season)
-except Exception as e:
-    st.error(f"Error loading Statcast data: {e}")
-    st.stop()
-
-if show_raw:
-    st.subheader(" Raw Statcast Data (Sample)")
-    st.dataframe(df_raw.head(25))
-
-# Engineer tunneling features
-df_tunnel = engineer_tunneling_features(df_raw)
-
-if df_tunnel.empty:
-    st.warning("No valid sequences with previous-pitch context were found for this pitcher/season.")
-    st.stop()
-
-if show_tunnel_sample:
-    st.subheader("🧪 Tunneling Features (Sample)")
-    st.dataframe(
-        df_tunnel[
-            [
-                "game_date",
-                "at_bat_number",
-                "pitch_number",
-                "pitch_type",
-                "release_pos_x",
-                "release_pos_z",
-                "release_speed",
-                "pfx_x",
-                "pfx_z",
-                "plate_x",
-                "plate_z",
-                "tunnel_score_norm",
-            ]
-        ].head(25)
+    game_summary = (
+        df_g.groupby(["game_pk", "game_date"])
+        .agg(
+            avg_tunnel_score=("tunnel_score_norm", "mean"),
+            runs_allowed=("bat_score", lambda s: float(s.max() - s.min())),
+            num_pitches=("pitch_type", "count"),
+        )
+        .reset_index()
+        .sort_values("game_date")
     )
+    return game_summary
+
 
 # -------------------------------------------------
-#  Your existing model / recommendation logic
+# Layout
 # -------------------------------------------------
-# At this point, df_tunnel contains EVERYTHING you used to have from the CSVs,
-# plus the new tunneling features:
-#   - release_diff, traj_diff, movement_diff, velo_diff
-#   - normalized versions
-#   - tunnel_score, tunnel_score_norm
-#
-# You can keep your RandomForestClassifier (or any other model) exactly the same,
-# just swap its input DataFrame from the old CSV-based one to df_tunnel.
-#
-# Below is an example stub showing how you might build a simple classifier
-# using the new tunneling features. Replace this with your current logic.
+st.title("Tunnel Score")
 
+# Sidebar controls
+st.sidebar.header("Settings")
 
-st.subheader("🔮 Example: Simple Next-Pitch Classifier Using Tunneling Features")
-st.caption(
-    "Replace this section with your existing model code. "
-    "Just make sure you use df_tunnel as your feature source."
+pitcher_name = st.sidebar.selectbox(
+    "Select Pitcher",
+    options=["Zack Wheeler"],
+    index=0,
 )
 
-# Example target: did the batter make weak contact or whiff?
-# You likely already have your own target definition; this is just a placeholder
-df_model = df_tunnel.copy()
+season = st.sidebar.number_input(
+    "Season", min_value=2015, max_value=2030, value=2024, step=1
+)
 
-# Example binary outcome: weak contact / strikeout vs everything else
-# (You should plug in your own label logic here)
-weak_events = ["strikeout", "swinging_strike", "foul_tip"]
-if "des" in df_model.columns:
-    df_model["target_good_outcome"] = df_model["des"].isin(weak_events).astype(int)
-else:
-    # Fallback dummy label so the code is runnable; replace with your own
-    df_model["target_good_outcome"] = (df_model["tunnel_score_norm"] > 0.5).astype(int)
+# Date range picker
+default_start = pd.to_datetime(f"{season}-03-01")
+default_end = pd.to_datetime(f"{season}-11-30")
 
-feature_cols = [
-    "tunnel_score_norm",
-    "release_diff_norm",
-    "movement_diff_norm",
-    "velo_diff_norm",
-]
+start_date, end_date = st.sidebar.date_input(
+    "Date range",
+    value=(default_start, default_end),
+)
 
-X = df_model[feature_cols]
-y = df_model["target_good_outcome"]
+# Ensure proper order
+if isinstance(start_date, list) or isinstance(start_date, tuple):
+    start_date, end_date = start_date
 
-# Guard against tiny datasets
-if X.shape[0] < 200 or y.nunique() < 2:
-    st.warning("⚠️ Not enough data or label variety to train an example model for this pitcher.")
-else:
-    X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=0.2, random_state=42, stratify=y
+if start_date > end_date:
+    st.sidebar.error("Start date must be on or before end date.")
+    st.stop()
+
+# Number of pitches to show in the sample table
+n_pitches = st.sidebar.slider(
+    "Number of pitches to display",
+    min_value=10,
+    max_value=100,
+    value=25,
+    step=5,
+)
+
+show_raw = st.sidebar.checkbox("Show raw Statcast sample", value=False)
+show_tunnel_sample = st.sidebar.checkbox(
+    "Show tunneling feature sample", value=True
+)
+
+# Load data
+with st.spinner(
+    f"Pulling Statcast data for {pitcher_name} "
+    f"from {start_date} to {end_date}..."
+):
+    df_raw = load_statcast_data(
+        pitcher_name,
+        start_date.strftime("%Y-%m-%d"),
+        end_date.strftime("%Y-%m-%d"),
     )
 
-    clf = RandomForestClassifier(
-        n_estimators=200,
-        max_depth=None,
-        min_samples_split=5,
-        random_state=42,
-        n_jobs=-1,
+if df_raw.empty:
+    st.warning("No Statcast data returned for this pitcher / date range.")
+    st.stop()
+
+st.caption(
+    f"Pulled Statcast data for **{pitcher_name}** from "
+    f"**{start_date.strftime('%Y-%m-%d')}** to "
+    f"**{end_date.strftime('%Y-%m-%d')}**."
+)
+
+# Optional: show raw Statcast sample
+if show_raw:
+    st.subheader("Raw Statcast Sample")
+    st.dataframe(df_raw.head(n_pitches))
+
+# Compute tunneling features
+df_tunnel = compute_tunneling_features(df_raw)
+
+if df_tunnel.empty:
+    st.warning(
+        "Not enough pitch sequences with previous-pitch context "
+        "to compute tunneling features in this date range."
     )
-    clf.fit(X_train, y_train)
+else:
+    # Tunneling feature sample
+    if show_tunnel_sample:
+        st.subheader("Tunneling Features (Sample)")
 
-    train_score = clf.score(X_train, y_train)
-    test_score = clf.score(X_test, y_test)
+        desired_cols = [
+            "game_date",
+            "pitch_type",
+            "tunnel_score_norm",
+            "outcome_velocity",
+            "outcome_result",
+            "batter_name",
+        ]
+        existing_sample_cols = [c for c in desired_cols if c in df_tunnel.columns]
 
+        if not existing_sample_cols:
+            st.info(
+                "Tunneling features computed, but requested display columns "
+                "were not found."
+            )
+        else:
+            st.dataframe(df_tunnel[existing_sample_cols].head(n_pitches))
+
+# -------------------------------------------------
+# Conceptual Summary
+# -------------------------------------------------
+st.markdown("## How This Tunnel Score Quantifies Pitch Tunneling")
+
+st.markdown(
+    """
+This dashboard is built around a **Tunnel Score** – a way to measure how well a
+pitcher disguises different pitch types within a sequence, eluding the batter to the best of the abilites.
+
+**Pitch tunneling** is the idea that multiple pitch types can:
+
+- Come out of almost the same release point, and  
+- Travel on nearly the same trajectory for as long as possible,  
+
+before separating late due to differences in spin and velocity. When a pitcher does this well,
+the hitter has to commit to a swing before the pitches visibly separate, which is where
+deception lives.
+"""
+)
+
+st.markdown(
+    """
+### What goes into the Tunnel Score?
+
+For each pitch, we compare it to the previous pitch in the at-bat and compute four components:
+
+1. Release Consistency – How close are the two release points?  
+2. Trajectory Consistency – How similar are the locations as the ball
+   travels toward the plate, how long is the tunnel duration?
+3. Movement Deception – How different are the movement profiles once pitches leave the tunnel?  
+4. Velocity Separation – How different are the velocities off the same tunnel?
+
+Each component is scaled to a 0–1 range and combined into a single **`tunnel_score_norm`**.
+"""
+)
+
+# -------------------------------------------------
+# Visualization: per-game avg tunnel score vs runs allowed
+# -------------------------------------------------
+st.markdown("## Per-Game Tunnel Score vs. Runs Allowed")
+
+game_summary = summarize_games(df_tunnel)
+
+if game_summary.empty:
+    st.info(
+        "Per-game summary could not be computed (no bat_score data for this range)."
+    )
+else:
     col1, col2 = st.columns(2)
+
     with col1:
-        st.metric("Training Accuracy", f"{train_score:.3f}")
+        st.markdown("**Average Tunnel Score by Game Date**")
+        line_chart_data = game_summary.set_index("game_date")[
+            ["avg_tunnel_score"]
+        ]
+        st.line_chart(line_chart_data)
+
     with col2:
-        st.metric("Test Accuracy", f"{test_score:.3f}")
+        st.markdown("**Tunnel Score vs. Runs Allowed (Regression View)**")
 
-    # Show feature importances to sanity-check tunneling impact
-    importances = pd.DataFrame(
-        {"feature": feature_cols, "importance": clf.feature_importances_}
-    ).sort_values("importance", ascending=False)
+        base = alt.Chart(game_summary).encode(
+            x=alt.X("avg_tunnel_score:Q", title="Average Tunnel Score (per game)"),
+            y=alt.Y("runs_allowed:Q", title="Runs Allowed"),
+            tooltip=[
+                alt.Tooltip("game_date:T", title="Game Date"),
+                alt.Tooltip("avg_tunnel_score:Q", title="Avg Tunnel Score"),
+                alt.Tooltip("runs_allowed:Q", title="Runs Allowed"),
+                alt.Tooltip("num_pitches:Q", title="Pitches"),
+            ],
+        )
 
-    st.subheader("📊 Feature Importances (Example Model)")
-    st.dataframe(importances)
+        scatter = base.mark_circle(size=70)
+        regression = base.transform_regression(
+            "avg_tunnel_score", "runs_allowed"
+        ).mark_line()
 
-    # You can then extend this to your full "Top 3 Recommended Pitches" logic
-    # by:
-    #   - Grouping df_tunnel by (prev_pitch_type, count, etc.)
-    #   - Aggregating tunnel_score_norm and model-predicted success probabilities
-    #   - Ranking pitch_type options
+        st.altair_chart(scatter + regression, use_container_width=True)
+
+    st.caption(
+        "Each point is one game in the selected date range. "
+        "The regression line shows the direction and strength of the relationship "
+        "between tunneling quality and runs allowed."
+    )
