@@ -1,5 +1,4 @@
-import math
-from typing import Dict
+from typing import Dict, Iterable, Optional
 
 import numpy as np
 import pandas as pd
@@ -19,6 +18,70 @@ st.set_page_config(
 # -------------------------------------------------
 # Helper functions
 # -------------------------------------------------
+def _ensure_column(df: pd.DataFrame, target: str, source_candidates: Iterable[str]) -> None:
+    """Create ``target`` from the first existing column in ``source_candidates``.
+
+    The new column is only filled when the target is missing. This utility lets us
+    gracefully handle Statcast schema variants (e.g., ``release_spin_rate`` vs
+    ``spin_rate``).
+    """
+
+    if target in df.columns:
+        return
+
+    for col in source_candidates:
+        if col in df.columns:
+            df[target] = df[col]
+            return
+
+
+def _compute_perceived_velocity(release_speed: pd.Series, extension: pd.Series) -> pd.Series:
+    """Estimate perceived velocity using extension.
+
+    Formula: velo * (60.5 / (60.5 - extension)) where distances are in feet.
+    Falls back to the raw release speed when extension is missing.
+    """
+
+    release_speed = pd.to_numeric(release_speed, errors="coerce")
+    extension = pd.to_numeric(extension, errors="coerce")
+
+    perceived = release_speed * (60.5 / (60.5 - extension.replace(0, np.nan)))
+    perceived = perceived.replace([np.inf, -np.inf], np.nan).fillna(release_speed)
+    return perceived
+
+
+def _compute_approach_angles(
+    release_x: pd.Series,
+    release_z: pd.Series,
+    plate_x: pd.Series,
+    plate_z: pd.Series,
+    extension: Optional[pd.Series] = None,
+) -> tuple[pd.Series, pd.Series]:
+    """Approximate horizontal and vertical approach angles in degrees.
+
+    Uses a simple geometry assumption from release point to plate over the remaining
+    distance (60.5 ft minus extension when available).
+    """
+
+    release_x = pd.to_numeric(release_x, errors="coerce")
+    release_z = pd.to_numeric(release_z, errors="coerce")
+    plate_x = pd.to_numeric(plate_x, errors="coerce")
+    plate_z = pd.to_numeric(plate_z, errors="coerce")
+
+    if extension is not None:
+        dist = 60.5 - pd.to_numeric(extension, errors="coerce").fillna(0.0)
+    else:
+        dist = pd.Series(60.5, index=release_x.index)
+
+    delta_x = plate_x - release_x
+    delta_z = plate_z - release_z
+
+    horiz_angle = np.degrees(np.arctan2(delta_x, dist))
+    vert_angle = np.degrees(np.arctan2(delta_z, dist))
+
+    return horiz_angle, vert_angle
+
+
 def get_pitcher_id(name: str) -> int:
     """
     Look up the MLBAM id for a pitcher using pybaseball's playerid_lookup.
@@ -43,7 +106,11 @@ def get_pitcher_id(name: str) -> int:
 def load_statcast_data(pitcher_name: str, start_date: str, end_date: str) -> pd.DataFrame:
     """
     Load Statcast data for a pitcher between start_date and end_date,
-    and attach batter names.
+    attach batter names, and normalize advanced tunneling fields.
+
+    The loader backfills common Statcast variants (e.g., release_spin_rate,
+    release_extension) and derives perceived velocity when possible so the
+    dashboard's advanced charts have data even when source schemas vary.
     """
     pitcher_id = get_pitcher_id(pitcher_name)
 
@@ -51,7 +118,29 @@ def load_statcast_data(pitcher_name: str, start_date: str, end_date: str) -> pd.
     if df is None or df.empty:
         return pd.DataFrame()
 
+    _ensure_column(df, "spin_rate", ["release_spin_rate"])
+    _ensure_column(df, "extension", ["release_extension"])
+
+    if "release_speed" in df.columns and "extension" in df.columns:
+        df["perceived_velocity"] = _compute_perceived_velocity(
+            df["release_speed"], df["extension"]
+        )
+
     # Basic fields we care about
+    advanced_keep_cols = [
+        "spin_rate",
+        "spin_axis",
+        "perceived_velocity",
+        "vertical_approach_angle",
+        "horizontal_approach_angle",
+        "extension",
+        "release_diff_from_avg",
+        "movement_diff_from_fastball",
+        "movement_diff_from_fastball_horizontal",
+        "movement_diff_from_fastball_vertical",
+        "velocity_diff_from_fastball",
+    ]
+
     keep_cols = [
         "game_date",
         "game_pk",
@@ -68,8 +157,9 @@ def load_statcast_data(pitcher_name: str, start_date: str, end_date: str) -> pd.
         "launch_speed",
         "events",
         "batter",
-        "bat_score",   # opponent's runs while this pitcher is on the mound
-    ]
+        "bat_score",
+    ] + advanced_keep_cols
+
     existing_cols = [c for c in keep_cols if c in df.columns]
     df = df[existing_cols].copy()
 
@@ -101,13 +191,11 @@ def load_statcast_data(pitcher_name: str, start_date: str, end_date: str) -> pd.
                 )
                 df.drop(columns=["key_mlbam"], inplace=True)
             except Exception:
-                # Fallback: use batter id as string if lookup fails
                 df["batter_name"] = df["batter"].astype(str)
         else:
             df["batter_name"] = df["batter"].astype(str)
 
     return df
-
 
 def compute_tunneling_features(df: pd.DataFrame) -> pd.DataFrame:
     """
@@ -117,6 +205,29 @@ def compute_tunneling_features(df: pd.DataFrame) -> pd.DataFrame:
         return df
 
     df = df.sort_values(["game_pk", "at_bat_number", "pitch_number"]).copy()
+
+    # Align schema variations so downstream displays remain populated
+    _ensure_column(df, "spin_rate", ["release_spin_rate"])
+    _ensure_column(df, "extension", ["release_extension"])
+
+    if "perceived_velocity" not in df.columns and {"release_speed", "extension"} <= set(df.columns):
+        df["perceived_velocity"] = _compute_perceived_velocity(
+            df["release_speed"], df["extension"]
+        )
+
+    if "vertical_approach_angle" not in df.columns or "horizontal_approach_angle" not in df.columns:
+        if {"release_pos_x", "release_pos_z", "plate_x", "plate_z"} <= set(df.columns):
+            h_angle, v_angle = _compute_approach_angles(
+                df.get("release_pos_x"),
+                df.get("release_pos_z"),
+                df.get("plate_x"),
+                df.get("plate_z"),
+                df.get("extension") if "extension" in df.columns else None,
+            )
+            if "horizontal_approach_angle" not in df.columns:
+                df["horizontal_approach_angle"] = h_angle
+            if "vertical_approach_angle" not in df.columns:
+                df["vertical_approach_angle"] = v_angle
 
     group_cols = ["game_pk", "at_bat_number"]
     cols_to_shift = [
@@ -133,8 +244,9 @@ def compute_tunneling_features(df: pd.DataFrame) -> pd.DataFrame:
         if col in df.columns:
             df[f"prev_{col}"] = df.groupby(group_cols)[col].shift(1)
 
-    prev_cols = [f"prev_{c}" for c in cols_to_shift if c in df.columns]
-    df = df.dropna(subset=prev_cols)
+    # Keep rows with a prior pitch context while allowing missing numeric data
+    if "prev_pitch_type" in df.columns:
+        df = df.dropna(subset=["prev_pitch_type"])
 
     def _safe(arr):
         return pd.to_numeric(arr, errors="coerce").fillna(0.0)
@@ -186,6 +298,41 @@ def compute_tunneling_features(df: pd.DataFrame) -> pd.DataFrame:
 
     df["tunnel_score_norm"] = _norm(df["tunnel_score"])
 
+    # Baseline-based feature gaps to populate dashboard visuals
+    if {"pitch_type", "release_pos_x", "release_pos_z"} <= set(df.columns):
+        release_avg = df.groupby("pitch_type")[
+            ["release_pos_x", "release_pos_z"]
+        ].transform("mean")
+        df["release_diff_from_avg"] = np.sqrt(
+            (pd.to_numeric(df["release_pos_x"], errors="coerce") - release_avg["release_pos_x"]) ** 2
+            + (pd.to_numeric(df["release_pos_z"], errors="coerce") - release_avg["release_pos_z"]) ** 2
+        )
+
+    fastball_labels = {"FF", "FA", "SI", "FT"}
+    if {"pitch_type", "pfx_x", "pfx_z"} <= set(df.columns):
+        fb_mask = df["pitch_type"].isin(fastball_labels)
+        if fb_mask.any():
+            fb_means = {
+                "pfx_x": pd.to_numeric(df.loc[fb_mask, "pfx_x"], errors="coerce").mean(),
+                "pfx_z": pd.to_numeric(df.loc[fb_mask, "pfx_z"], errors="coerce").mean(),
+                "release_speed": pd.to_numeric(df.loc[fb_mask, "release_speed"], errors="coerce").mean(),
+            }
+
+            df["movement_diff_from_fastball_horizontal"] = (
+                pd.to_numeric(df["pfx_x"], errors="coerce") - fb_means["pfx_x"]
+            )
+            df["movement_diff_from_fastball_vertical"] = (
+                pd.to_numeric(df["pfx_z"], errors="coerce") - fb_means["pfx_z"]
+            )
+            df["movement_diff_from_fastball"] = np.sqrt(
+                df["movement_diff_from_fastball_horizontal"] ** 2
+                + df["movement_diff_from_fastball_vertical"] ** 2
+            )
+
+            df["velocity_diff_from_fastball"] = (
+                pd.to_numeric(df["release_speed"], errors="coerce") - fb_means["release_speed"]
+            )
+
     return df
 
 
@@ -194,22 +341,30 @@ def summarize_games(df_tunnel: pd.DataFrame) -> pd.DataFrame:
     Per-game summary: average tunnel score and runs allowed.
     Runs allowed ~= max(bat_score) - min(bat_score) while pitcher is on mound.
     """
-    if df_tunnel.empty or "bat_score" not in df_tunnel.columns:
+    if df_tunnel.empty:
         return pd.DataFrame()
 
     df_g = df_tunnel.copy()
     df_g["game_date"] = pd.to_datetime(df_g["game_date"])
 
+    agg_dict = {
+        "avg_tunnel_score": ("tunnel_score_norm", "mean"),
+        "num_pitches": ("pitch_type", "count"),
+    }
+
+    if "bat_score" in df_g.columns:
+        agg_dict["runs_allowed"] = ("bat_score", lambda s: float(s.max() - s.min()))
+
     game_summary = (
         df_g.groupby(["game_pk", "game_date"])
-        .agg(
-            avg_tunnel_score=("tunnel_score_norm", "mean"),
-            runs_allowed=("bat_score", lambda s: float(s.max() - s.min())),
-            num_pitches=("pitch_type", "count"),
-        )
+        .agg(**agg_dict)
         .reset_index()
         .sort_values("game_date")
     )
+
+    if "runs_allowed" not in game_summary.columns:
+        game_summary["runs_allowed"] = np.nan
+
     return game_summary
 
 
@@ -221,11 +376,11 @@ st.title("Tunnel Score")
 # Sidebar controls
 st.sidebar.header("Settings")
 
-pitcher_name = st.sidebar.selectbox(
-    "Select Pitcher",
-    options=["Zack Wheeler"],
-    index=0,
-)
+pitcher_name = st.sidebar.text_input(
+    "Pitcher name",
+    value="Zack Wheeler",
+    help="Enter any MLB pitcher (First Last).",
+).strip() or "Zack Wheeler"
 
 season = st.sidebar.number_input(
     "Season", min_value=2015, max_value=2030, value=2024, step=1
@@ -260,6 +415,9 @@ n_pitches = st.sidebar.slider(
 show_raw = st.sidebar.checkbox("Show raw Statcast sample", value=False)
 show_tunnel_sample = st.sidebar.checkbox(
     "Show tunneling feature sample", value=True
+)
+show_advanced_features = st.sidebar.checkbox(
+    "Show advanced tunneling features", value=False
 )
 
 # Load data
@@ -309,6 +467,23 @@ else:
             "outcome_result",
             "batter_name",
         ]
+        advanced_cols = [
+            "spin_rate",
+            "spin_axis",
+            "perceived_velocity",
+            "vertical_approach_angle",
+            "horizontal_approach_angle",
+            "extension",
+            "release_diff_from_avg",
+            "movement_diff_from_fastball",
+            "movement_diff_from_fastball_horizontal",
+            "movement_diff_from_fastball_vertical",
+            "velocity_diff_from_fastball",
+        ]
+
+        if show_advanced_features:
+            desired_cols.extend(advanced_cols)
+
         existing_sample_cols = [c for c in desired_cols if c in df_tunnel.columns]
 
         if not existing_sample_cols:
@@ -331,8 +506,8 @@ pitcher disguises different pitch types within a sequence, eluding the batter to
 
 **Pitch tunneling** is the idea that multiple pitch types can:
 
-- Come out of almost the same release point, and  
-- Travel on nearly the same trajectory for as long as possible,  
+- Come out of almost the same release point, and
+- Travel on nearly the same trajectory for as long as possible,
 
 before separating late due to differences in spin and velocity. When a pitcher does this well,
 the hitter has to commit to a swing before the pitches visibly separate, which is where
@@ -346,10 +521,10 @@ st.markdown(
 
 For each pitch, we compare it to the previous pitch in the at-bat and compute four components:
 
-1. Release Consistency – How close are the two release points?  
+1. Release Consistency – How close are the two release points?
 2. Trajectory Consistency – How similar are the locations as the ball
    travels toward the plate, how long is the tunnel duration?
-3. Movement Deception – How different are the movement profiles once pitches leave the tunnel?  
+3. Movement Deception – How different are the movement profiles once pitches leave the tunnel?
 4. Velocity Separation – How different are the velocities off the same tunnel?
 
 Each component is scaled to a 0–1 range and combined into a single **`tunnel_score_norm`**.
@@ -397,6 +572,38 @@ else:
         ).mark_line()
 
         st.altair_chart(scatter + regression, use_container_width=True)
+
+    st.markdown("**Tunneling Features vs. Normalized Tunnel Score**")
+    scatter_cols = st.columns(3)
+
+    scatter_specs = [
+        ("spin_rate", "Spin Rate"),
+        ("extension", "Extension"),
+        ("perceived_velocity", "Perceived Velocity"),
+    ]
+
+    for spec, container in zip(scatter_specs, scatter_cols):
+        field, label = spec
+        with container:
+            if field in df_tunnel.columns:
+                chart = (
+                    alt.Chart(df_tunnel)
+                    .mark_circle(size=60, opacity=0.7)
+                    .encode(
+                        x=alt.X(f"{field}:Q", title=label),
+                        y=alt.Y("tunnel_score_norm:Q", title="Normalized Tunnel Score"),
+                        tooltip=[
+                            alt.Tooltip("game_date:T", title="Game Date"),
+                            alt.Tooltip(f"{field}:Q", title=label),
+                            alt.Tooltip("tunnel_score_norm:Q", title="Tunnel Score Norm"),
+                        ],
+                    )
+                )
+                st.altair_chart(chart, use_container_width=True)
+            else:
+                st.info(
+                    f"{label} data not available in the current dataset to plot."
+                )
 
     st.caption(
         "Each point is one game in the selected date range. "
