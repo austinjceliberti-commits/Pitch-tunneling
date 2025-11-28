@@ -1,6 +1,21 @@
 streamlit
-pybaseball
 pandas
 numpy
+altair
+
+# Pitch Tunneling
+pybaseball
 scikit-learn
+
+# NFL Penalty Dashboard
+nfl_data_py
+
+# Networking / SSL
+requests
+urllib3
+certifi
+
+# Optional (recommended locally)
+watchdog
+
 
